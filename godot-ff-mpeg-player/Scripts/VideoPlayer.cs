@@ -3,6 +3,7 @@ using System;
 using System.IO;
 using System.Reflection;
 using System.Runtime.InteropServices;
+using static VideoPlayer;
 
 public partial class VideoPlayer : Control
 {
@@ -10,6 +11,9 @@ public partial class VideoPlayer : Control
 
 	[Export]
 	private TextureRect _videoDisplay;
+
+	[Export] 
+	private AudioStreamPlayer _audioPlayer;
 
 	static VideoPlayer()
 	{
@@ -33,11 +37,6 @@ public partial class VideoPlayer : Control
 
 		// Fallback to default loading if not matched
 		return IntPtr.Zero;
-	}
-
-	public override void _Process(double delta)
-	{
-		RenderNextVideoFrame(delta);
 	}
 
 	#region File Dialog
@@ -76,7 +75,7 @@ public partial class VideoPlayer : Control
 
 	protected void OnVideoFileOpened(string inputPath)
 	{
-		InitVideoStream(inputPath);
+		InitMediaStream(inputPath);
 	}
 
 	protected void ConfigureVideoFilters()
@@ -104,136 +103,180 @@ public partial class VideoPlayer : Control
 	}
 	#endregion
 
-	#region Test FillArray
-
-	[DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
-	private static extern void FillArray([In, Out] int[] array, int size);
-
-	[DllImport(DllName, CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Ansi)]
-	private static extern int OpenVideoFile(string filePath, ref VideoInfo outInfo);
-
-	private void PrintArray(int[] array)
-	{
-		for (int i = 0; i < array.Length; i++)
-		{
-			GD.Print($"Index {i}: {array[i]}");
-		}
-	}
-	#endregion
-
 	#region Play Video
-	private IntPtr _decoderHandle = IntPtr.Zero;
-	private byte[] _frameBuffer;
+	[StructLayout(LayoutKind.Sequential)]
+	public struct MediaInfo
+	{
+		public int Width;
+		public int Height;
+		public double Fps;
+		public double DurationSeconds;
+		public int SampleRate;
+		public int Channels;
+		public int HasVideo;
+		public int HasAudio;
+	}
+
+	private IntPtr _containerHandle = IntPtr.Zero;
+	private MediaInfo _mediaInfo;
+
+	// Video rendering buffers
+	private byte[] _videoFrameBuffer;
 	private Image _godotImage;
 	private ImageTexture _godotTexture;
-	private int _width;
-	private int _height;
 
-	public double TargetFps = 30.0;
-
-	private double _frameInterval;
+	// Video timing control
+	private double _frameInterval = 0.0333; // Default ~30 FPS
 	private double _timeAccumulator = 0.0;
 
+	// Audio streaming buffers
+	private float[] _audioBuffer;
+	private AudioStreamGeneratorPlayback _audioPlayback;
+
 	[DllImport(DllName, CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Ansi)]
-	private static extern IntPtr CreateDecoder(string filePath, out int width, out int height, out double fps);
+	private static extern IntPtr OpenContainer(string filePath, ref MediaInfo outInfo);
 
 	[DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
-	private static extern int ReadNextFrame(IntPtr decoder, byte[] outRgbaBuffer);
+	private static extern int ReadNextVideoFrame(IntPtr container, byte[] outRgbaBuffer);
 
 	[DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
-	private static extern void FreeDecoder(IntPtr decoder);
+	private static extern int ReadNextAudioSamples(IntPtr container, float[] outFloatBuffer, int maxSamples);
 
-	public void RenderNextVideoFrame(double delta)
+	[DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
+	private static extern void FreeContainer(IntPtr container);
+
+	public void InitMediaStream(string filePath)
 	{
-		if (_decoderHandle == IntPtr.Zero) return;
+		_mediaInfo = new MediaInfo();
+		_containerHandle = OpenContainer(filePath, ref _mediaInfo);
 
-		// Accumulate time passed
+		if (_containerHandle == IntPtr.Zero)
+		{
+			GD.PrintErr($"[FFmpeg] Failed to open container: {filePath}");
+			return;
+		}
+
+		GD.Print($"[FFmpeg] Loaded: {filePath}");
+		GD.Print($"[FFmpeg] Duration: {_mediaInfo.DurationSeconds:F2}s");
+
+		// --- Setup Video (if present) ---
+		if (_mediaInfo.HasVideo == 1)
+		{
+			_frameInterval = 1.0 / (_mediaInfo.Fps > 0 ? _mediaInfo.Fps : 30.0);
+			_timeAccumulator = 0.0;
+
+			GD.Print($"[FFmpeg] Video Stream: {_mediaInfo.Width}x{_mediaInfo.Height} @ {_mediaInfo.Fps:F2} FPS");
+
+			// Allocate RGBA pixel buffer (4 bytes per pixel)
+			_videoFrameBuffer = new byte[_mediaInfo.Width * _mediaInfo.Height * 4];
+
+			// Initialize Godot Image and TextureRect
+			_godotImage = Image.CreateEmpty(_mediaInfo.Width, _mediaInfo.Height, false, Image.Format.Rgba8);
+			_godotTexture = ImageTexture.CreateFromImage(_godotImage);
+			_videoDisplay.Texture = _godotTexture;
+		}
+
+		// --- Setup Audio (if present) ---
+		if (_mediaInfo.HasAudio == 1 && _audioPlayer != null)
+		{
+			GD.Print("[FFmpeg] Audio Stream Output: Standard 48000 Hz Stereo");
+
+			// Allocate buffer for audio sample batches (2048 stereo sample pairs)
+			_audioBuffer = new float[2048 * 2];
+
+			// Create a fresh generator instance set to 48000 Hz
+			AudioStreamGenerator generator = new AudioStreamGenerator();
+			generator.MixRate = 48000;
+			generator.BufferLength = 0.2f; // 200ms buffer capacity
+			_audioPlayer.Stream = generator;
+
+			// Start playback to spin up the audio device stream
+			_audioPlayer.Play();
+			_audioPlayback = _audioPlayer.GetStreamPlayback() as AudioStreamGeneratorPlayback;
+
+			// PRE-BUFFER: Push initial samples BEFORE video playback begins
+			if (_audioPlayback != null)
+			{
+				FillAudioBuffer();
+			}
+		}
+	}
+
+	public override void _Process(double delta)
+	{
+		if (_containerHandle == IntPtr.Zero) return;
+
+		// 1. Process Audio Stream First (Low-latency audio takes priority)
+		if (_mediaInfo.HasAudio == 1)
+		{
+			FillAudioBuffer();
+		}
+
+		// 2. Process Video Frame Rendering (with timing accumulator circuit breaker)
+		if (_mediaInfo.HasVideo == 1)
+		{
+			RenderNextVideoFrame(delta);
+		}
+	}
+
+	private void RenderNextVideoFrame(double delta)
+	{
 		_timeAccumulator += delta;
 
-		// Preventive Measure: If accumulator gets way too far ahead (e.g., > 0.2s after window focus/lag),
-		// clamp it so it doesn't trigger back-to-back frame decodes to catch up.
+		// Circuit Breaker: Cap accumulator at 0.2s to prevent catch-up speedups during lag spikes
 		if (_timeAccumulator > 0.2)
 		{
 			_timeAccumulator = _frameInterval;
 		}
 
-		// Process frames while we are behind schedule
 		if (_timeAccumulator >= _frameInterval)
 		{
 			_timeAccumulator -= _frameInterval;
 
-			int result = ReadNextFrame(_decoderHandle, _frameBuffer);
+			int result = ReadNextVideoFrame(_containerHandle, _videoFrameBuffer);
 
 			if (result == 0)
 			{
-				_godotImage.SetData(_width, _height, false, Image.Format.Rgba8, _frameBuffer);
+				_godotImage.SetData(_mediaInfo.Width, _mediaInfo.Height, false, Image.Format.Rgba8, _videoFrameBuffer);
 				_godotTexture.Update(_godotImage);
 			}
 			else if (result == 1)
 			{
-				GD.Print("End of video reached.");
-				SetProcess(false);
+				GD.Print("[FFmpeg] End of video stream reached.");
+				SetProcess(false); // Stop processing on EOF
 			}
+		}
+	}
+
+	private void FillAudioBuffer()
+	{
+		if (_audioPlayback == null) return;
+
+		int framesAvailable = _audioPlayback.GetFramesAvailable();
+		if (framesAvailable <= 0) return;
+
+		// Cap batch read size to local audio buffer length
+		int samplesToRead = Math.Min(framesAvailable, 2048);
+
+		int samplesRead = ReadNextAudioSamples(_containerHandle, _audioBuffer, samplesToRead);
+
+		for (int i = 0; i < samplesRead; i++)
+		{
+			float leftChannel = _audioBuffer[i * 2];
+			float rightChannel = _audioBuffer[i * 2 + 1];
+
+			// Push stereo sample pair (Vector2: X=Left, Y=Right) to Godot Audio Engine
+			_audioPlayback.PushFrame(new Vector2(leftChannel, rightChannel));
 		}
 	}
 
 	public override void _ExitTree()
 	{
-		if (_decoderHandle != IntPtr.Zero)
+		if (_containerHandle != IntPtr.Zero)
 		{
-			FreeDecoder(_decoderHandle);
-			_decoderHandle = IntPtr.Zero;
-			GD.Print("Native decoder freed cleanly.");
-		}
-	}
-
-	public void InitVideoStream(string inputPath)
-	{
-		double realFps;
-		_decoderHandle = CreateDecoder(inputPath, out _width, out _height, out realFps);
-
-		if (_decoderHandle != IntPtr.Zero)
-		{
-			TargetFps = realFps > 0 ? realFps : 30.0;
-			_frameInterval = 1.0 / TargetFps;
-			_timeAccumulator = 0.0; // Ensure accumulator starts fresh at 0
-
-			GD.Print($"Decoder initialized: {_width}x{_height} @ {TargetFps:F2} FPS");
-
-			_frameBuffer = new byte[_width * _height * 4];
-			_godotImage = Image.CreateEmpty(_width, _height, false, Image.Format.Rgba8);
-			_godotTexture = ImageTexture.CreateFromImage(_godotImage);
-			_videoDisplay.Texture = _godotTexture;
-		}
-	}
-	#endregion
-
-	#region Open Video
-	// Layout must match C++ VideoInfo struct
-	[StructLayout(LayoutKind.Sequential)]
-	public struct VideoInfo
-	{
-		public int Width;
-		public int Height;
-		public double DurationSeconds;
-		public int HasAudio;
-	}
-
-	public void RetrieveVideoInfo(string inputPath)
-	{
-		VideoInfo info = new VideoInfo();
-
-		int result = OpenVideoFile(inputPath, ref info);
-
-		if (result == 0)
-		{
-			GD.Print($"[FFmpeg] Resolution: {info.Width}x{info.Height}");
-			GD.Print($"[FFmpeg] Duration: {info.DurationSeconds:F2}s");
-			GD.Print($"[FFmpeg] Audio Stream Present: {(info.HasAudio == 1 ? "Yes" : "No")}");
-		}
-		else
-		{
-			GD.PrintErr($"OpenVideoFile failed with error code: {result}");
+			FreeContainer(_containerHandle);
+			_containerHandle = IntPtr.Zero;
+			GD.Print("[FFmpeg] Container handle freed cleanly.");
 		}
 	}
 	#endregion
