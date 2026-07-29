@@ -255,17 +255,17 @@ public partial class VideoPlayer : Control
 		int framesAvailable = _audioPlayback.GetFramesAvailable();
 		if (framesAvailable <= 0) return;
 
-		// Cap batch read size to local audio buffer length
-		int samplesToRead = Math.Min(framesAvailable, 2048);
+		// Cap request to our internal buffer limit (2048 stereo frames)
+		int framesToRead = Math.Min(framesAvailable, 2048);
 
-		int samplesRead = ReadNextAudioSamples(_containerHandle, _audioBuffer, samplesToRead);
+		// Read stereo frames from C++ DLL
+		int framesRead = ReadNextAudioSamples(_containerHandle, _audioBuffer, framesToRead);
 
-		for (int i = 0; i < samplesRead; i++)
+		for (int i = 0; i < framesRead; i++)
 		{
-			float leftChannel = _audioBuffer[i * 2];
-			float rightChannel = _audioBuffer[i * 2 + 1];
+			float leftChannel = Math.Clamp(_audioBuffer[i * 2], -1.0f, 1.0f);
+			float rightChannel = Math.Clamp(_audioBuffer[i * 2 + 1], -1.0f, 1.0f);
 
-			// Push stereo sample pair (Vector2: X=Left, Y=Right) to Godot Audio Engine
 			_audioPlayback.PushFrame(new Vector2(leftChannel, rightChannel));
 		}
 	}
