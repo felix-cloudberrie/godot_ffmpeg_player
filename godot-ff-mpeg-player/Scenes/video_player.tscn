@@ -3,6 +3,7 @@
 [ext_resource type="Script" uid="uid://cfc1wevik7gm6" path="res://Scripts/VideoPlayer.cs" id="1_ak1cw"]
 
 [sub_resource type="AudioStreamGenerator" id="AudioStreamGenerator_ak1cw"]
+mix_rate = 48000.0
 
 [node name="VideoPlayer" type="Control" unique_id=1526387276 node_paths=PackedStringArray("_videoDisplay", "_audioPlayer")]
 layout_mode = 3
