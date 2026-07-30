@@ -1,0 +1,9 @@
+{
+  "profiles": {
+    "Godot Player Debug": {
+      "commandName": "Executable",
+      "executablePath": "C:\\Users\\ASUS PRIME\\Documents\\Work Files\\Nextlayer\\Godot Builds\\Godot_v4.6.1-stable_mono_win64\\Godot_v4.6.1-stable_mono_win64.exe",
+      "workingDirectory": "C:\\Users\\ASUS PRIME\\Documents\\Work Files\\Nextlayer\\Godot Projects\\godot_ffmpeg_player\\godot_ffmpeg_player\\godot-ff-mpeg-player"
+    }
+  }
+}
