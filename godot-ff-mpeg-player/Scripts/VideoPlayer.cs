@@ -105,6 +105,16 @@ public partial class VideoPlayer : Control
 
 	#region Play Video
 	[StructLayout(LayoutKind.Sequential)]
+	public struct QueueDiagnostics
+	{
+		public int AudioPacketCount;
+		public int VideoPacketCount;
+		public UIntPtr AudioQueueBytes;
+		public UIntPtr VideoQueueBytes;
+		public double TotalMemoryMB;
+	}
+
+	[StructLayout(LayoutKind.Sequential)]
 	public struct MediaInfo
 	{
 		public int Width;
@@ -132,6 +142,9 @@ public partial class VideoPlayer : Control
 	// Audio streaming buffers
 	private float[] _audioBuffer;
 	private AudioStreamGeneratorPlayback _audioPlayback;
+
+	[DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
+	private static extern QueueDiagnostics GetQueueDiagnostics(IntPtr container);
 
 	[DllImport(DllName, CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Ansi)]
 	private static extern IntPtr OpenContainer(string filePath, ref MediaInfo outInfo);
@@ -216,6 +229,16 @@ public partial class VideoPlayer : Control
 		if (_mediaInfo.HasVideo == 1)
 		{
 			RenderNextVideoFrame(delta);
+		}
+
+		if (_containerHandle != IntPtr.Zero)
+		{
+			QueueDiagnostics diag = GetQueueDiagnostics(_containerHandle);
+
+			// Print or display on an On-Screen Debug HUD:
+			GD.Print($"Video Queue: {diag.VideoPacketCount} pkts ({diag.VideoQueueBytes.ToUInt64() / 1024} KB)");
+			GD.Print($"Audio Queue: {diag.AudioPacketCount} pkts ({diag.AudioQueueBytes.ToUInt64() / 1024} KB)");
+			GD.Print($"Total RAM: {diag.TotalMemoryMB:F2} MB");
 		}
 	}
 
