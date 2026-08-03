@@ -111,7 +111,9 @@ public partial class VideoPlayer : Control
 		public int VideoPacketCount;
 		public UIntPtr AudioQueueBytes;
 		public UIntPtr VideoQueueBytes;
-		public double TotalMemoryMB;
+		public UIntPtr PeakAudioQueueBytes;
+		public UIntPtr PeakVideoQueueBytes;
+		public double TotalMemoryKB;
 	}
 
 	[StructLayout(LayoutKind.Sequential)]
@@ -238,7 +240,9 @@ public partial class VideoPlayer : Control
 			// Print or display on an On-Screen Debug HUD:
 			GD.Print($"Video Queue: {diag.VideoPacketCount} pkts ({diag.VideoQueueBytes.ToUInt64() / 1024} KB)");
 			GD.Print($"Audio Queue: {diag.AudioPacketCount} pkts ({diag.AudioQueueBytes.ToUInt64() / 1024} KB)");
-			GD.Print($"Total RAM: {diag.TotalMemoryMB:F2} MB");
+			GD.Print($"Peak Video Bytes: ({diag.PeakVideoQueueBytes / 1024} KB)");
+			GD.Print($"Peak Audio Bytes: ({diag.PeakAudioQueueBytes / 1024} KB)");
+			GD.Print($"Total RAM: {diag.TotalMemoryKB:F2} KB");
 		}
 	}
 
