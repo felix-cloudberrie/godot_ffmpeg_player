@@ -177,7 +177,7 @@ public partial class VideoPlayer : Control
 		// --- Setup Video (if present) ---
 		if (_mediaInfo.HasVideo == 1)
 		{
-			_frameInterval = 1.0 / (_mediaInfo.Fps > 0 ? _mediaInfo.Fps : 30.0);
+			_frameInterval = 1.0 / 30.0;
 			_timeAccumulator = 0.0;
 
 			GD.Print($"[FFmpeg] Video Stream: {_mediaInfo.Width}x{_mediaInfo.Height} @ {_mediaInfo.Fps:F2} FPS");
@@ -238,11 +238,14 @@ public partial class VideoPlayer : Control
 			QueueDiagnostics diag = GetQueueDiagnostics(_containerHandle);
 
 			// Print or display on an On-Screen Debug HUD:
-			GD.Print($"Video Queue: {diag.VideoPacketCount} pkts ({diag.VideoQueueBytes.ToUInt64() / 1024} KB)");
-			GD.Print($"Audio Queue: {diag.AudioPacketCount} pkts ({diag.AudioQueueBytes.ToUInt64() / 1024} KB)");
-			GD.Print($"Peak Video Bytes: ({diag.PeakVideoQueueBytes / 1024} KB)");
-			GD.Print($"Peak Audio Bytes: ({diag.PeakAudioQueueBytes / 1024} KB)");
-			GD.Print($"Total RAM: {diag.TotalMemoryKB:F2} KB");
+			if (diag.TotalMemoryKB > 0f)
+			{
+				GD.Print($"Video Queue: {diag.VideoPacketCount} pkts ({diag.VideoQueueBytes.ToUInt64() / 1024} KB)");
+				GD.Print($"Audio Queue: {diag.AudioPacketCount} pkts ({diag.AudioQueueBytes.ToUInt64() / 1024} KB)");
+				GD.Print($"Peak Video Bytes: ({diag.PeakVideoQueueBytes} Bytes)");
+				GD.Print($"Peak Audio Bytes: ({diag.PeakAudioQueueBytes} Bytes)");
+				GD.Print($"Total RAM: {diag.TotalMemoryKB:F2} KB");
+			}
 		}
 	}
 
