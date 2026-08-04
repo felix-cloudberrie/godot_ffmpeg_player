@@ -109,6 +109,8 @@ public partial class VideoPlayer : Control
 	{
 		public int AudioPacketCount;
 		public int VideoPacketCount;
+		public int TotalAudioPacketCount;
+		public int TotalVideoPacketCount;
 		public UIntPtr AudioQueueBytes;
 		public UIntPtr VideoQueueBytes;
 		public UIntPtr PeakAudioQueueBytes;
@@ -232,21 +234,6 @@ public partial class VideoPlayer : Control
 		{
 			RenderNextVideoFrame(delta);
 		}
-
-		if (_containerHandle != IntPtr.Zero)
-		{
-			QueueDiagnostics diag = GetQueueDiagnostics(_containerHandle);
-
-			// Print or display on an On-Screen Debug HUD:
-			if (diag.TotalMemoryKB > 0f)
-			{
-				GD.Print($"Video Queue: {diag.VideoPacketCount} pkts ({diag.VideoQueueBytes.ToUInt64() / 1024} KB)");
-				GD.Print($"Audio Queue: {diag.AudioPacketCount} pkts ({diag.AudioQueueBytes.ToUInt64() / 1024} KB)");
-				GD.Print($"Peak Video Bytes: ({diag.PeakVideoQueueBytes} Bytes)");
-				GD.Print($"Peak Audio Bytes: ({diag.PeakAudioQueueBytes} Bytes)");
-				GD.Print($"Total RAM: {diag.TotalMemoryKB:F2} KB");
-			}
-		}
 	}
 
 	private void RenderNextVideoFrame(double delta)
@@ -274,8 +261,20 @@ public partial class VideoPlayer : Control
 			{
 				GD.Print("[FFmpeg] End of video stream reached.");
 				SetProcess(false); // Stop processing on EOF
+				PrintDiagnostics();
 			}
 		}
+	}
+
+	private void PrintDiagnostics()
+	{
+		QueueDiagnostics diag = GetQueueDiagnostics(_containerHandle);
+
+		// Print or display on an On-Screen Debug HUD:
+		GD.Print($"Total Video Packets: {diag.TotalVideoPacketCount} packets");
+		GD.Print($"Total Audio Packets: {diag.TotalAudioPacketCount} packets");
+		GD.Print($"Peak Video Bytes: ({diag.PeakVideoQueueBytes} Bytes)");
+		GD.Print($"Peak Audio Bytes: ({diag.PeakAudioQueueBytes} Bytes)");
 	}
 
 	private void FillAudioBuffer()
