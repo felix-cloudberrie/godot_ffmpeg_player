@@ -3,10 +3,33 @@ using System;
 using System.IO;
 using System.Reflection;
 using System.Runtime.InteropServices;
-using static VideoPlayer;
 
 public partial class VideoPlayer : Control
 {
+	private struct YuvTexturePlane
+	{
+		public Image Image;
+		public ImageTexture Texture;
+
+		public static YuvTexturePlane Create(int width, int height)
+		{
+			var plane = new YuvTexturePlane();
+			plane.Image = Image.CreateEmpty(width, height, false, Image.Format.R8);
+			plane.Texture = ImageTexture.CreateFromImage(plane.Image);
+			return plane;
+		}
+
+		public void Update(int width, int height, byte[] buffer)
+		{
+			Image.SetData(width, height, false, Image.Format.R8, buffer);
+			Texture.Update(Image);
+		}
+	}
+
+	private YuvTexturePlane _yPlane;
+	private YuvTexturePlane _uPlane;
+	private YuvTexturePlane _vPlane;
+
 	private const string DllName = "FFMpegInterface";
 
 	[Export]
@@ -115,6 +138,7 @@ public partial class VideoPlayer : Control
 		public UIntPtr VideoQueueBytes;
 		public UIntPtr PeakAudioQueueBytes;
 		public UIntPtr PeakVideoQueueBytes;
+		public UIntPtr PeakDecodedFrameBytes;
 		public double TotalMemoryKB;
 	}
 
@@ -135,9 +159,15 @@ public partial class VideoPlayer : Control
 	private MediaInfo _mediaInfo;
 
 	// Video rendering buffers
-	private byte[] _videoFrameBuffer;
-	private Image _godotImage;
-	private ImageTexture _godotTexture;
+	private byte[] _yBuffer;
+	private byte[] _uBuffer;
+	private byte[] _vBuffer;
+	private Image _yImage, _uImage, _vImage;
+	private ImageTexture _yTexture, _uTexture, _vTexture;
+	private ShaderMaterial _shaderMaterial;
+
+	private int _videoWidth;
+	private int _videoHeight;
 
 	// Video timing control
 	private double _frameInterval = 0.0333; // Default ~30 FPS
@@ -154,7 +184,7 @@ public partial class VideoPlayer : Control
 	private static extern IntPtr OpenContainer(string filePath, ref MediaInfo outInfo);
 
 	[DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
-	private static extern int ReadNextVideoFrame(IntPtr container, byte[] outRgbaBuffer);
+	private static extern int ReadNextVideoFrame(IntPtr container, byte[] outY, byte[] outU, byte[] outV);
 
 	[DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
 	private static extern int ReadNextAudioSamples(IntPtr container, float[] outFloatBuffer, int maxSamples);
@@ -184,13 +214,7 @@ public partial class VideoPlayer : Control
 
 			GD.Print($"[FFmpeg] Video Stream: {_mediaInfo.Width}x{_mediaInfo.Height} @ {_mediaInfo.Fps:F2} FPS");
 
-			// Allocate RGBA pixel buffer (4 bytes per pixel)
-			_videoFrameBuffer = new byte[_mediaInfo.Width * _mediaInfo.Height * 4];
-
-			// Initialize Godot Image and TextureRect
-			_godotImage = Image.CreateEmpty(_mediaInfo.Width, _mediaInfo.Height, false, Image.Format.Rgba8);
-			_godotTexture = ImageTexture.CreateFromImage(_godotImage);
-			_videoDisplay.Texture = _godotTexture;
+			InitializeYuvTextures(_mediaInfo.Width, _mediaInfo.Height);
 		}
 
 		// --- Setup Audio (if present) ---
@@ -219,6 +243,61 @@ public partial class VideoPlayer : Control
 		}
 	}
 
+	public void InitializeYuvTextures(int width, int height, double fps = 30.0)
+	{
+		_videoWidth = width;
+		_videoHeight = height;
+
+		int chromaW = width / 2;
+		int chromaH = height / 2;
+
+		// Allocate memory buffers
+		_yBuffer = new byte[width * height];
+		_uBuffer = new byte[chromaW * chromaH];
+		_vBuffer = new byte[chromaW * chromaH];
+
+		// Create Planes
+		_yPlane = YuvTexturePlane.Create(width, height);
+		_uPlane = YuvTexturePlane.Create(chromaW, chromaH);
+		_vPlane = YuvTexturePlane.Create(chromaW, chromaH);
+
+		// Bind GPU textures to the Shader
+		// --- Ensure we have a unique ShaderMaterial on the TextureRect ---
+		if (_videoDisplay.Material is ShaderMaterial existingMat)
+		{
+			// Duplicate so runtime parameter changes bind to this specific instance
+			_shaderMaterial = (ShaderMaterial)existingMat.Duplicate();
+			_videoDisplay.Material = _shaderMaterial;
+		}
+		else
+		{
+			// Fallback: Create and assign ShaderMaterial if empty in Inspector
+			var shader = GD.Load<Shader>("res://Shaders/yuv_shader.gdshader");
+			_shaderMaterial = new ShaderMaterial { Shader = shader };
+			_videoDisplay.Material = _shaderMaterial;
+		}
+
+		_shaderMaterial.SetShaderParameter("texture_y", _yPlane.Texture);
+		_shaderMaterial.SetShaderParameter("texture_u", _uPlane.Texture);
+		_shaderMaterial.SetShaderParameter("texture_v", _vPlane.Texture);
+
+		// Give TextureRect a valid texture handle so Godot calculates node bounds
+		_videoDisplay.Texture = _yPlane.Texture;
+	}
+
+	private void UploadTexturesToGpu()
+	{
+		// Y Plane: full resolution
+		_yPlane.Update(_videoWidth, _videoHeight, _yBuffer);
+
+		// U and V Planes: half resolution (chroma subsampled)
+		int chromaW = _videoWidth / 2;
+		int chromaH = _videoHeight / 2;
+
+		_uPlane.Update(chromaW, chromaH, _uBuffer);
+		_vPlane.Update(chromaW, chromaH, _vBuffer);
+	}
+
 	public override void _Process(double delta)
 	{
 		if (_containerHandle == IntPtr.Zero) return;
@@ -232,38 +311,42 @@ public partial class VideoPlayer : Control
 		// 2. Process Video Frame Rendering (with timing accumulator circuit breaker)
 		if (_mediaInfo.HasVideo == 1)
 		{
-			RenderNextVideoFrame(delta);
+			// Accumulate delta time from Godot's frame render loop
+			_timeAccumulator += delta;
+
+			// Check if enough time has passed to advance to the next video frame
+			if (_timeAccumulator >= _frameInterval)
+			{
+				// Subtract interval instead of setting to 0 to preserve timing sub-frame accuracy
+				_timeAccumulator -= _frameInterval;
+
+				// Guard against large lag spikes/hangups accumulating many missed frames
+				if (_timeAccumulator > _frameInterval * 2)
+				{
+					_timeAccumulator = 0.0;
+				}
+
+				RenderNextVideoFrame();
+			}
 		}
 	}
 
-	private void RenderNextVideoFrame(double delta)
+	private bool RenderNextVideoFrame()
 	{
-		_timeAccumulator += delta;
+		// 1. Fetch Y, U, V byte arrays directly from C++ DLL
+		int result = ReadNextVideoFrame(_containerHandle, _yBuffer, _uBuffer, _vBuffer);
 
-		// Circuit Breaker: Cap accumulator at 0.2s to prevent catch-up speedups during lag spikes
-		if (_timeAccumulator > 0.2)
+		if (result != 0)
 		{
-			_timeAccumulator = _frameInterval;
+			SetProcess(false); // Stop processing on EOF
+			PrintDiagnostics();
+			return false;
 		}
 
-		if (_timeAccumulator >= _frameInterval)
-		{
-			_timeAccumulator -= _frameInterval;
+		// 2. Upload the updated byte arrays to GPU textures via our YuvTexturePlane structs
+		UploadTexturesToGpu();
 
-			int result = ReadNextVideoFrame(_containerHandle, _videoFrameBuffer);
-
-			if (result == 0)
-			{
-				_godotImage.SetData(_mediaInfo.Width, _mediaInfo.Height, false, Image.Format.Rgba8, _videoFrameBuffer);
-				_godotTexture.Update(_godotImage);
-			}
-			else if (result == 1)
-			{
-				GD.Print("[FFmpeg] End of video stream reached.");
-				SetProcess(false); // Stop processing on EOF
-				PrintDiagnostics();
-			}
-		}
+		return true;
 	}
 
 	private void PrintDiagnostics()
@@ -273,8 +356,7 @@ public partial class VideoPlayer : Control
 		// Print or display on an On-Screen Debug HUD:
 		GD.Print($"Total Video Packets: {diag.TotalVideoPacketCount} packets");
 		GD.Print($"Total Audio Packets: {diag.TotalAudioPacketCount} packets");
-		GD.Print($"Peak Video Bytes: ({diag.PeakVideoQueueBytes} Bytes)");
-		GD.Print($"Peak Audio Bytes: ({diag.PeakAudioQueueBytes} Bytes)");
+		GD.Print($"Peak Video Bytes: ({diag.PeakDecodedFrameBytes} Bytes)");
 	}
 
 	private void FillAudioBuffer()

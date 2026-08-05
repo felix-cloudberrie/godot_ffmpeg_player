@@ -1,6 +1,10 @@
 [gd_scene format=3 uid="uid://b8ltmmu474vum"]
 
 [ext_resource type="Script" uid="uid://cfc1wevik7gm6" path="res://Scripts/VideoPlayer.cs" id="1_ak1cw"]
+[ext_resource type="Shader" uid="uid://b56a6shokof0s" path="res://Shaders/yuv_shader.gdshader" id="2_x0qam"]
+
+[sub_resource type="ShaderMaterial" id="ShaderMaterial_t10ye"]
+shader = ExtResource("2_x0qam")
 
 [sub_resource type="AudioStreamGenerator" id="AudioStreamGenerator_ak1cw"]
 mix_rate = 48000.0
@@ -17,6 +21,7 @@ _videoDisplay = NodePath("TextureRect")
 _audioPlayer = NodePath("AudioStreamPlayer")
 
 [node name="TextureRect" type="TextureRect" parent="." unique_id=941978594]
+material = SubResource("ShaderMaterial_t10ye")
 layout_mode = 1
 anchors_preset = 15
 anchor_right = 1.0
