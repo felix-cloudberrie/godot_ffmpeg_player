@@ -181,9 +181,20 @@ public partial class VideoPlayer : Control
 
 	public void TogglePlay()
 	{
-		GD.Print("Toggle Play");
 		IsPlaying = !IsPlaying;
-		_audioPlayer.StreamPaused = !IsPlaying;
+
+		if (_audioPlayer != null)
+		{
+			_audioPlayer.StreamPaused = !IsPlaying;
+
+			// Ensure stream is active if resuming from a paused state
+			if (IsPlaying && !_audioPlayer.Playing)
+			{
+				_audioPlayer.Play();
+			}
+		}
+
+		GD.Print($"[VideoPlayer] Playback State: {(IsPlaying ? "PLAYING" : "PAUSED")}");
 	}
 
 	protected void OpenVideoFile()
@@ -247,6 +258,17 @@ public partial class VideoPlayer : Control
 				_videoBuffer = new CircularBuffer<YuvFrame>(15);
 				InitializeYuvTextures(_mediaInfo.Width, _mediaInfo.Height);
 			}
+
+			// Render first frame to signal successful load
+			if (_mediaInfo.HasVideo == 0 || _containerHandle == IntPtr.Zero) return;
+
+			YuvFrame firstFrame = new YuvFrame(_videoWidth, _videoHeight);
+			int result = ReadNextVideoFrame(_containerHandle, firstFrame.Y, firstFrame.U, firstFrame.V);
+
+			if (result == 0)
+			{
+				RenderFrame(firstFrame);
+			}
 		}
 
 		if (_mediaInfo.HasAudio == 1 && _audioPlayer != null)
@@ -258,6 +280,13 @@ public partial class VideoPlayer : Control
 				_audioBuffer = new CircularBuffer<float[]>(12);
 				SetupAudioPlayer();
 			}
+		}
+
+		// Set initial playback state (e.g. paused on load)
+		IsPlaying = false;
+		if (_audioPlayer != null)
+		{
+			_audioPlayer.StreamPaused = true;
 		}
 
 		_isWorkerRunning = true;
@@ -381,7 +410,7 @@ public partial class VideoPlayer : Control
 
 	public override void _Process(double delta)
 	{
-		if (_containerHandle == IntPtr.Zero || !_isWorkerRunning || !IsPlaying) return;
+		if (_containerHandle == IntPtr.Zero || !IsPlaying) return;
 
 		// 1. Audio Processing Priority
 		if (_mediaInfo.HasAudio == 1)
@@ -428,12 +457,17 @@ public partial class VideoPlayer : Control
 
 		if (frameRetrieved)
 		{
-			int chromaW = _videoWidth / 2;
-			int chromaH = _videoHeight / 2;
-			_yPlane.Update(_videoWidth, _videoHeight, frameToRender.Y);
-			_uPlane.Update(chromaW, chromaH, frameToRender.U);
-			_vPlane.Update(chromaW, chromaH, frameToRender.V);
+			RenderFrame(frameToRender);
 		}
+	}
+
+	private void RenderFrame(YuvFrame frameToRender)
+	{
+		int chromaW = _videoWidth / 2;
+		int chromaH = _videoHeight / 2;
+		_yPlane.Update(_videoWidth, _videoHeight, frameToRender.Y);
+		_uPlane.Update(chromaW, chromaH, frameToRender.U);
+		_vPlane.Update(chromaW, chromaH, frameToRender.V);
 	}
 
 	private void FillAudioBuffer()
