@@ -3,9 +3,62 @@ using System;
 using System.IO;
 using System.Reflection;
 using System.Runtime.InteropServices;
+using System.Threading;
 
 public partial class VideoPlayer : Control
 {
+	private const string DllName = "FFMpegInterface";
+
+	[Export] private TextureRect _videoDisplay;
+	[Export] private AudioStreamPlayer _audioPlayer;
+
+	// --- Interop Structs ---
+	[StructLayout(LayoutKind.Sequential)]
+	public struct MediaInfo
+	{
+		public int Width;
+		public int Height;
+		public double Fps;
+		public double DurationSeconds;
+		public int SampleRate;
+		public int Channels;
+		public int HasVideo;
+		public int HasAudio;
+	}
+
+	[StructLayout(LayoutKind.Sequential)]
+	public struct QueueDiagnostics
+	{
+		public int AudioPacketCount;
+		public int VideoPacketCount;
+		public int TotalAudioPacketCount;
+		public int TotalVideoPacketCount;
+		public UIntPtr AudioQueueBytes;
+		public UIntPtr VideoQueueBytes;
+		public UIntPtr PeakAudioQueueBytes;
+		public UIntPtr PeakVideoQueueBytes;
+		public UIntPtr PeakDecodedFrameBytes;
+		public double TotalMemoryKB;
+	}
+
+	// --- Decoded YUV Frame Container ---
+	public struct YuvFrame
+	{
+		public byte[] Y;
+		public byte[] U;
+		public byte[] V;
+
+		public YuvFrame(int width, int height)
+		{
+			int chromaW = width / 2;
+			int chromaH = height / 2;
+			Y = new byte[width * height];
+			U = new byte[chromaW * chromaH];
+			V = new byte[chromaW * chromaH];
+		}
+	}
+
+	// --- YUV Texture Plane Wrapper ---
 	private struct YuvTexturePlane
 	{
 		public Image Image;
@@ -26,21 +79,24 @@ public partial class VideoPlayer : Control
 		}
 	}
 
-	private YuvTexturePlane _yPlane;
-	private YuvTexturePlane _uPlane;
-	private YuvTexturePlane _vPlane;
+	// --- Native DLL Exports ---
+	[DllImport(DllName, CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Ansi)]
+	private static extern IntPtr OpenContainer(string filePath, ref MediaInfo outInfo);
 
-	private const string DllName = "FFMpegInterface";
+	[DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
+	private static extern int ReadNextVideoFrame(IntPtr container, byte[] outY, byte[] outU, byte[] outV);
 
-	[Export]
-	private TextureRect _videoDisplay;
+	[DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
+	private static extern int ReadNextAudioSamples(IntPtr container, float[] outFloatBuffer, int maxSamples);
 
-	[Export] 
-	private AudioStreamPlayer _audioPlayer;
+	[DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
+	private static extern QueueDiagnostics GetQueueDiagnostics(IntPtr container);
+
+	[DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
+	private static extern void FreeContainer(IntPtr container);
 
 	static VideoPlayer()
 	{
-		// Register custom DLL loader for native libraries
 		NativeLibrary.SetDllImportResolver(typeof(VideoPlayer).Assembly, ResolveNativeLibrary);
 	}
 
@@ -48,33 +104,49 @@ public partial class VideoPlayer : Control
 	{
 		if (libraryName == DllName)
 		{
-			// Point to your relative subfolder
 			string relativePath = Path.Combine("native", "x64", $"{libraryName}.dll");
 			string fullPath = Path.Combine(Directory.GetCurrentDirectory(), relativePath);
-
-			if (File.Exists(fullPath))
-			{
-				return NativeLibrary.Load(fullPath);
-			}
+			if (File.Exists(fullPath)) return NativeLibrary.Load(fullPath);
 		}
-
-		// Fallback to default loading if not matched
 		return IntPtr.Zero;
 	}
 
-	#region File Dialog
-	public override void _Input(InputEvent @event)
-	{
-		if (@event is InputEventKey eventKey && eventKey.Pressed)
-		{
-			if (eventKey.Keycode == Key.O)
-			{
-				GD.Print("Open Video File...");
-				OpenVideoFile();
-			}
-		}
-	}
+	// --- VIDEO SYNCHRONIZATION ---
+	private readonly object _videoLock = new object();
+	private readonly AutoResetEvent _videoBufferEvent = new AutoResetEvent(false);
+	private CircularBuffer<YuvFrame> _videoBuffer;
 
+	// --- AUDIO SYNCHRONIZATION ---
+	private readonly object _audioLock = new object();
+	private readonly AutoResetEvent _audioBufferEvent = new AutoResetEvent(false);
+	private CircularBuffer<float[]> _audioBuffer;
+
+	// Background decoding thread
+	private Thread _workerThread;
+	private volatile bool _isWorkerRunning = false;
+
+	// FFmpeg state
+	private IntPtr _containerHandle = IntPtr.Zero;
+	private MediaInfo _mediaInfo;
+
+	// Rendering & Shader State
+	private YuvTexturePlane _yPlane, _uPlane, _vPlane;
+	private ShaderMaterial _shaderMaterial;
+	private int _videoWidth;
+	private int _videoHeight;
+
+	// Audio Playback State
+	private AudioStreamGeneratorPlayback _audioPlayback;
+	private const int AudioChunkFrames = 2048; // 2048 stereo frame pairs per buffer unit
+
+	// Timing Control
+	private double _frameInterval = 1.0 / 30.0;
+	private double _timeAccumulator = 0.0;
+
+	public bool IsPlaying { get; private set; } = false;
+	private bool _isLastFrameRetrieved = false;
+
+	#region File Dialog
 	protected FileDialog _videoDialog = null;
 	protected FileDialog VideoDialog
 	{
@@ -89,6 +161,29 @@ public partial class VideoPlayer : Control
 
 			return _videoDialog;
 		}
+	}
+
+	public override void _Input(InputEvent @event)
+	{
+		if (@event is InputEventKey eventKey && eventKey.Pressed)
+		{
+			if (eventKey.Keycode == Key.O)
+			{
+				GD.Print("Open Video File...");
+				OpenVideoFile();
+			}
+			else if (eventKey.Keycode == Key.P)
+			{
+				TogglePlay();
+			}
+		}
+	}
+
+	public void TogglePlay()
+	{
+		GD.Print("Toggle Play");
+		IsPlaying = !IsPlaying;
+		_audioPlayer.StreamPaused = !IsPlaying;
 	}
 
 	protected void OpenVideoFile()
@@ -126,74 +221,11 @@ public partial class VideoPlayer : Control
 	}
 	#endregion
 
-	#region Play Video
-	[StructLayout(LayoutKind.Sequential)]
-	public struct QueueDiagnostics
-	{
-		public int AudioPacketCount;
-		public int VideoPacketCount;
-		public int TotalAudioPacketCount;
-		public int TotalVideoPacketCount;
-		public UIntPtr AudioQueueBytes;
-		public UIntPtr VideoQueueBytes;
-		public UIntPtr PeakAudioQueueBytes;
-		public UIntPtr PeakVideoQueueBytes;
-		public UIntPtr PeakDecodedFrameBytes;
-		public double TotalMemoryKB;
-	}
-
-	[StructLayout(LayoutKind.Sequential)]
-	public struct MediaInfo
-	{
-		public int Width;
-		public int Height;
-		public double Fps;
-		public double DurationSeconds;
-		public int SampleRate;
-		public int Channels;
-		public int HasVideo;
-		public int HasAudio;
-	}
-
-	private IntPtr _containerHandle = IntPtr.Zero;
-	private MediaInfo _mediaInfo;
-
-	// Video rendering buffers
-	private byte[] _yBuffer;
-	private byte[] _uBuffer;
-	private byte[] _vBuffer;
-	private Image _yImage, _uImage, _vImage;
-	private ImageTexture _yTexture, _uTexture, _vTexture;
-	private ShaderMaterial _shaderMaterial;
-
-	private int _videoWidth;
-	private int _videoHeight;
-
-	// Video timing control
-	private double _frameInterval = 0.0333; // Default ~30 FPS
-	private double _timeAccumulator = 0.0;
-
-	// Audio streaming buffers
-	private float[] _audioBuffer;
-	private AudioStreamGeneratorPlayback _audioPlayback;
-
-	[DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
-	private static extern QueueDiagnostics GetQueueDiagnostics(IntPtr container);
-
-	[DllImport(DllName, CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Ansi)]
-	private static extern IntPtr OpenContainer(string filePath, ref MediaInfo outInfo);
-
-	[DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
-	private static extern int ReadNextVideoFrame(IntPtr container, byte[] outY, byte[] outU, byte[] outV);
-
-	[DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
-	private static extern int ReadNextAudioSamples(IntPtr container, float[] outFloatBuffer, int maxSamples);
-
-	[DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
-	private static extern void FreeContainer(IntPtr container);
-
 	public void InitMediaStream(string filePath)
 	{
+		// Stop any running thread before re-initializing
+		StopWorkerThread();
+
 		_mediaInfo = new MediaInfo();
 		_containerHandle = OpenContainer(filePath, ref _mediaInfo);
 
@@ -204,46 +236,40 @@ public partial class VideoPlayer : Control
 		}
 
 		GD.Print($"[FFmpeg] Loaded: {filePath}");
-		GD.Print($"[FFmpeg] Duration: {_mediaInfo.DurationSeconds:F2}s");
+		GD.Print($"Duration: {_mediaInfo.DurationSeconds:F2}s");
+		GD.Print($"Resolution: {_mediaInfo.Width} x {_mediaInfo.Height}");
 
-		// --- Setup Video (if present) ---
 		if (_mediaInfo.HasVideo == 1)
 		{
-			_frameInterval = 1.0 / 30.0;
-			_timeAccumulator = 0.0;
-
-			GD.Print($"[FFmpeg] Video Stream: {_mediaInfo.Width}x{_mediaInfo.Height} @ {_mediaInfo.Fps:F2} FPS");
-
-			InitializeYuvTextures(_mediaInfo.Width, _mediaInfo.Height);
-		}
-
-		// --- Setup Audio (if present) ---
-		if (_mediaInfo.HasAudio == 1 && _audioPlayer != null)
-		{
-			GD.Print("[FFmpeg] Audio Stream Output: Standard 48000 Hz Stereo");
-
-			// Allocate buffer for audio sample batches (2048 stereo sample pairs)
-			_audioBuffer = new float[2048 * 2];
-
-			// Create a fresh generator instance set to 48000 Hz
-			AudioStreamGenerator generator = new AudioStreamGenerator();
-			generator.MixRate = 48000;
-			generator.BufferLength = 0.2f; // 200ms buffer capacity
-			_audioPlayer.Stream = generator;
-
-			// Start playback to spin up the audio device stream
-			_audioPlayer.Play();
-			_audioPlayback = _audioPlayer.GetStreamPlayback() as AudioStreamGeneratorPlayback;
-
-			// PRE-BUFFER: Push initial samples BEFORE video playback begins
-			if (_audioPlayback != null)
+			lock (_videoLock)
 			{
-				FillAudioBuffer();
+				// 500ms at 30 FPS = 15 Frames
+				_videoBuffer = new CircularBuffer<YuvFrame>(15);
+				InitializeYuvTextures(_mediaInfo.Width, _mediaInfo.Height);
 			}
 		}
+
+		if (_mediaInfo.HasAudio == 1 && _audioPlayer != null)
+		{
+			lock (_audioLock)
+			{
+				// 500ms at 48kHz Stereo (~24,000 samples). 
+				// Each chunk holds 2048 stereo frames (~42.6ms), so 12 chunks = ~500ms.
+				_audioBuffer = new CircularBuffer<float[]>(12);
+				SetupAudioPlayer();
+			}
+		}
+
+		_isWorkerRunning = true;
+		_workerThread = new Thread(WorkerThreadLoop)
+		{
+			Name = "FFmpeg_Producer_Thread",
+			IsBackground = true
+		};
+		_workerThread.Start();
 	}
 
-	public void InitializeYuvTextures(int width, int height, double fps = 30.0)
+	private void InitializeYuvTextures(int width, int height)
 	{
 		_videoWidth = width;
 		_videoHeight = height;
@@ -251,27 +277,17 @@ public partial class VideoPlayer : Control
 		int chromaW = width / 2;
 		int chromaH = height / 2;
 
-		// Allocate memory buffers
-		_yBuffer = new byte[width * height];
-		_uBuffer = new byte[chromaW * chromaH];
-		_vBuffer = new byte[chromaW * chromaH];
-
-		// Create Planes
 		_yPlane = YuvTexturePlane.Create(width, height);
 		_uPlane = YuvTexturePlane.Create(chromaW, chromaH);
 		_vPlane = YuvTexturePlane.Create(chromaW, chromaH);
 
-		// Bind GPU textures to the Shader
-		// --- Ensure we have a unique ShaderMaterial on the TextureRect ---
 		if (_videoDisplay.Material is ShaderMaterial existingMat)
 		{
-			// Duplicate so runtime parameter changes bind to this specific instance
 			_shaderMaterial = (ShaderMaterial)existingMat.Duplicate();
 			_videoDisplay.Material = _shaderMaterial;
 		}
 		else
 		{
-			// Fallback: Create and assign ShaderMaterial if empty in Inspector
 			var shader = GD.Load<Shader>("res://Shaders/yuv_shader.gdshader");
 			_shaderMaterial = new ShaderMaterial { Shader = shader };
 			_videoDisplay.Material = _shaderMaterial;
@@ -281,46 +297,108 @@ public partial class VideoPlayer : Control
 		_shaderMaterial.SetShaderParameter("texture_u", _uPlane.Texture);
 		_shaderMaterial.SetShaderParameter("texture_v", _vPlane.Texture);
 
-		// Give TextureRect a valid texture handle so Godot calculates node bounds
 		_videoDisplay.Texture = _yPlane.Texture;
 	}
 
-	private void UploadTexturesToGpu()
+	private void SetupAudioPlayer()
 	{
-		// Y Plane: full resolution
-		_yPlane.Update(_videoWidth, _videoHeight, _yBuffer);
+		AudioStreamGenerator generator = new AudioStreamGenerator();
+		generator.MixRate = 48000;
+		generator.BufferLength = 0.2f; // 200ms device buffer capacity
+		_audioPlayer.Stream = generator;
+		_audioPlayer.Play();
+		_audioPlayback = _audioPlayer.GetStreamPlayback() as AudioStreamGeneratorPlayback;
+	}
 
-		// U and V Planes: half resolution (chroma subsampled)
-		int chromaW = _videoWidth / 2;
-		int chromaH = _videoHeight / 2;
+	private void WorkerThreadLoop()
+	{
+		// Wait handle array so the thread can sleep until EITHER buffer needs filling
+		WaitHandle[] waitHandles = new WaitHandle[] { _videoBufferEvent, _audioBufferEvent };
 
-		_uPlane.Update(chromaW, chromaH, _uBuffer);
-		_vPlane.Update(chromaW, chromaH, _vBuffer);
+		while (_isWorkerRunning)
+		{
+			bool needMoreVideo = false;
+			bool needMoreAudio = false;
+
+			// Check Video Capacity
+			lock (_videoLock)
+			{
+				if (_videoBuffer != null && !_videoBuffer.IsFull())
+					needMoreVideo = true;
+			}
+
+			// Check Audio Capacity
+			lock (_audioLock)
+			{
+				if (_audioBuffer != null && !_audioBuffer.IsFull())
+					needMoreAudio = true;
+			}
+
+			// If BOTH buffers are full, sleep until consumer signals one of them
+			if (!needMoreVideo && !needMoreAudio)
+			{
+				WaitHandle.WaitAny(waitHandles, 10); // Sleep until signaled or 10ms timeout
+				continue;
+			}
+
+			// --- DECODE VIDEO IF NEEDED ---
+			if (needMoreVideo)
+			{
+				YuvFrame frame = new YuvFrame(_videoWidth, _videoHeight);
+				int result = ReadNextVideoFrame(_containerHandle, frame.Y, frame.U, frame.V);
+
+				if (result == 0)
+				{
+					lock (_videoLock)
+					{
+						_videoBuffer.Push(frame);
+					}
+				}
+				else if (result == 1) // EOF
+				{
+					_isWorkerRunning = false;
+					PrintDiagnostics();
+					break;
+				}
+			}
+
+			// --- DECODE AUDIO IF NEEDED ---
+			if (needMoreAudio)
+			{
+				float[] audioChunk = new float[AudioChunkFrames * 2];
+				int framesRead = ReadNextAudioSamples(_containerHandle, audioChunk, AudioChunkFrames);
+
+				if (framesRead > 0)
+				{
+					lock (_audioLock)
+					{
+						_audioBuffer.Push(audioChunk);
+					}
+				}
+			}
+		}
 	}
 
 	public override void _Process(double delta)
 	{
-		if (_containerHandle == IntPtr.Zero) return;
+		if (_containerHandle == IntPtr.Zero || !_isWorkerRunning || !IsPlaying) return;
 
-		// 1. Process Audio Stream First (Low-latency audio takes priority)
+		// 1. Audio Processing Priority
 		if (_mediaInfo.HasAudio == 1)
 		{
 			FillAudioBuffer();
 		}
 
-		// 2. Process Video Frame Rendering (with timing accumulator circuit breaker)
+		// 2. Video Rendering Synchronization
 		if (_mediaInfo.HasVideo == 1)
 		{
-			// Accumulate delta time from Godot's frame render loop
 			_timeAccumulator += delta;
 
-			// Check if enough time has passed to advance to the next video frame
 			if (_timeAccumulator >= _frameInterval)
 			{
-				// Subtract interval instead of setting to 0 to preserve timing sub-frame accuracy
 				_timeAccumulator -= _frameInterval;
 
-				// Guard against large lag spikes/hangups accumulating many missed frames
+				// Circuit breaker for large frame drops
 				if (_timeAccumulator > _frameInterval * 2)
 				{
 					_timeAccumulator = 0.0;
@@ -331,22 +409,75 @@ public partial class VideoPlayer : Control
 		}
 	}
 
-	private bool RenderNextVideoFrame()
+	private void RenderNextVideoFrame()
 	{
-		// 1. Fetch Y, U, V byte arrays directly from C++ DLL
-		int result = ReadNextVideoFrame(_containerHandle, _yBuffer, _uBuffer, _vBuffer);
+		YuvFrame frameToRender = default;
+		bool frameRetrieved = false;
 
-		if (result != 0)
+		lock (_videoLock)
 		{
-			SetProcess(false); // Stop processing on EOF
-			PrintDiagnostics();
-			return false;
+			if (_videoBuffer != null && !_videoBuffer.IsEmpty())
+			{
+				frameToRender = _videoBuffer.Pop();
+				frameRetrieved = true;
+
+				// Signal worker thread that VIDEO buffer has space
+				_videoBufferEvent.Set();
+			}
 		}
 
-		// 2. Upload the updated byte arrays to GPU textures via our YuvTexturePlane structs
-		UploadTexturesToGpu();
+		if (frameRetrieved)
+		{
+			int chromaW = _videoWidth / 2;
+			int chromaH = _videoHeight / 2;
+			_yPlane.Update(_videoWidth, _videoHeight, frameToRender.Y);
+			_uPlane.Update(chromaW, chromaH, frameToRender.U);
+			_vPlane.Update(chromaW, chromaH, frameToRender.V);
+		}
+	}
 
-		return true;
+	private void FillAudioBuffer()
+	{
+		if (_audioPlayback == null) return;
+
+		int framesAvailable = _audioPlayback.GetFramesAvailable();
+		if (framesAvailable < AudioChunkFrames) return;
+
+		float[] audioChunk = null;
+
+		lock (_audioLock)
+		{
+			if (_audioBuffer != null && !_audioBuffer.IsEmpty())
+			{
+				audioChunk = _audioBuffer.Pop();
+
+				// Signal worker thread that AUDIO buffer has space
+				_audioBufferEvent.Set();
+			}
+		}
+
+		if (audioChunk != null)
+		{
+			for (int i = 0; i < AudioChunkFrames; i++)
+			{
+				float left = Math.Clamp(audioChunk[i * 2], -1.0f, 1.0f);
+				float right = Math.Clamp(audioChunk[i * 2 + 1], -1.0f, 1.0f);
+				_audioPlayback.PushFrame(new Vector2(left, right));
+			}
+		}
+	}
+
+	private void StopWorkerThread()
+	{
+		_isWorkerRunning = false;
+		_videoBufferEvent.Set(); // Wake up worker if waiting on video
+		_audioBufferEvent.Set(); // Wake up worker if waiting on audio
+
+		if (_workerThread != null && _workerThread.IsAlive)
+		{
+			_workerThread.Join(500);
+			_workerThread = null;
+		}
 	}
 
 	private void PrintDiagnostics()
@@ -359,30 +490,11 @@ public partial class VideoPlayer : Control
 		GD.Print($"Peak Video Bytes: ({diag.PeakDecodedFrameBytes} Bytes)");
 	}
 
-	private void FillAudioBuffer()
-	{
-		if (_audioPlayback == null) return;
-
-		int framesAvailable = _audioPlayback.GetFramesAvailable();
-		if (framesAvailable <= 0) return;
-
-		// Cap request to our internal buffer limit (2048 stereo frames)
-		int framesToRead = Math.Min(framesAvailable, 2048);
-
-		// Read stereo frames from C++ DLL
-		int framesRead = ReadNextAudioSamples(_containerHandle, _audioBuffer, framesToRead);
-
-		for (int i = 0; i < framesRead; i++)
-		{
-			float leftChannel = Math.Clamp(_audioBuffer[i * 2], -1.0f, 1.0f);
-			float rightChannel = Math.Clamp(_audioBuffer[i * 2 + 1], -1.0f, 1.0f);
-
-			_audioPlayback.PushFrame(new Vector2(leftChannel, rightChannel));
-		}
-	}
 
 	public override void _ExitTree()
 	{
+		StopWorkerThread();
+
 		if (_containerHandle != IntPtr.Zero)
 		{
 			FreeContainer(_containerHandle);
@@ -390,5 +502,4 @@ public partial class VideoPlayer : Control
 			GD.Print("[FFmpeg] Container handle freed cleanly.");
 		}
 	}
-	#endregion
 }
