@@ -1,0 +1,41 @@
+[gd_scene format=3 uid="uid://v7cp1kebxjih"]
+
+[ext_resource type="PackedScene" uid="uid://b8ltmmu474vum" path="res://Scenes/video_player.tscn" id="1_n81n8"]
+[ext_resource type="Script" uid="uid://bdar14ky81rlu" path="res://Scripts/VideoBoard.cs" id="1_tsc4f"]
+
+[node name="VideoBoard" type="Control" unique_id=788499939 node_paths=PackedStringArray("_videoPlayers")]
+layout_mode = 3
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+script = ExtResource("1_tsc4f")
+_videoPlayers = [NodePath("GridContainer/VideoPlayer"), NodePath("GridContainer/VideoPlayer2"), NodePath("GridContainer/VideoPlayer3"), NodePath("GridContainer/VideoPlayer4")]
+
+[node name="GridContainer" type="GridContainer" parent="." unique_id=618307260]
+layout_mode = 1
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+theme_override_constants/h_separation = 0
+theme_override_constants/v_separation = 0
+columns = 2
+
+[node name="VideoPlayer" parent="GridContainer" unique_id=1526387276 instance=ExtResource("1_n81n8")]
+layout_mode = 2
+IsInputEnabled = false
+
+[node name="VideoPlayer2" parent="GridContainer" unique_id=855771212 instance=ExtResource("1_n81n8")]
+layout_mode = 2
+IsInputEnabled = false
+
+[node name="VideoPlayer3" parent="GridContainer" unique_id=633202798 instance=ExtResource("1_n81n8")]
+layout_mode = 2
+IsInputEnabled = false
+
+[node name="VideoPlayer4" parent="GridContainer" unique_id=32556541 instance=ExtResource("1_n81n8")]
+layout_mode = 2
+IsInputEnabled = false

@@ -111,6 +111,9 @@ public partial class VideoPlayer : Control
 		return IntPtr.Zero;
 	}
 
+	[Export]
+	public bool IsInputEnabled = true;
+
 	// --- VIDEO SYNCHRONIZATION ---
 	private readonly object _videoLock = new object();
 	private readonly AutoResetEvent _videoBufferEvent = new AutoResetEvent(false);
@@ -167,6 +170,9 @@ public partial class VideoPlayer : Control
 	{
 		if (@event is InputEventKey eventKey && eventKey.Pressed)
 		{
+			if (!IsInputEnabled)
+				return;
+
 			if (eventKey.Keycode == Key.O)
 			{
 				GD.Print("Open Video File...");
