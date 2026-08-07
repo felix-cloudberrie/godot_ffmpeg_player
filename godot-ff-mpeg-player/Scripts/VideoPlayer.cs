@@ -61,21 +61,28 @@ public partial class VideoPlayer : Control
 	// --- YUV Texture Plane Wrapper ---
 	private struct YuvTexturePlane
 	{
-		public Image Image;
 		public ImageTexture Texture;
+		public Rid TextureRid;
 
 		public static YuvTexturePlane Create(int width, int height)
 		{
 			var plane = new YuvTexturePlane();
-			plane.Image = Image.CreateEmpty(width, height, false, Image.Format.R8);
-			plane.Texture = ImageTexture.CreateFromImage(plane.Image);
+
+			// 1. Create an empty image ONCE to initialize the texture allocation in GPU VRAM
+			using var img = Image.CreateEmpty(width, height, false, Image.Format.R8);
+			plane.Texture = ImageTexture.CreateFromImage(img);
+
+			// 2. Fetch and store the low-level GPU Resource ID (RID)
+			plane.TextureRid = plane.Texture.GetRid();
 			return plane;
 		}
 
 		public void Update(int width, int height, byte[] buffer)
 		{
-			Image.SetData(width, height, false, Image.Format.R8, buffer);
-			Texture.Update(Image);
+			// Direct push to RenderingServer bypassing Image.SetData & Texture.Update wrappers
+			// Image.Format.R8 corresponds to format enum value 0
+			using var img = Image.CreateFromData(width, height, false, Image.Format.R8, buffer);
+			RenderingServer.Texture2DUpdate(TextureRid, img, 0);
 		}
 	}
 
@@ -84,7 +91,7 @@ public partial class VideoPlayer : Control
 	private static extern IntPtr OpenContainer(string filePath, ref MediaInfo outInfo);
 
 	[DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
-	private static extern int ReadNextVideoFrame(IntPtr container, byte[] outY, byte[] outU, byte[] outV);
+	private static extern int ReadNextVideoFrame(IntPtr container, byte[] outY, byte[] outU, byte[] outV, int targetWidth, int targetHeight);
 
 	[DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
 	private static extern int ReadNextAudioSamples(IntPtr container, float[] outFloatBuffer, int maxSamples);
@@ -128,6 +135,10 @@ public partial class VideoPlayer : Control
 	private Thread _workerThread;
 	private volatile bool _isWorkerRunning = false;
 
+	// audio feeder thread
+	private Thread _audioThread;
+	private volatile bool _isAudioRunning = false;
+
 	// FFmpeg state
 	private IntPtr _containerHandle = IntPtr.Zero;
 	private MediaInfo _mediaInfo;
@@ -135,8 +146,6 @@ public partial class VideoPlayer : Control
 	// Rendering & Shader State
 	private YuvTexturePlane _yPlane, _uPlane, _vPlane;
 	private ShaderMaterial _shaderMaterial;
-	private int _videoWidth;
-	private int _videoHeight;
 
 	// Audio Playback State
 	private AudioStreamGeneratorPlayback _audioPlayback;
@@ -145,6 +154,9 @@ public partial class VideoPlayer : Control
 	// Timing Control
 	private double _frameInterval = 1.0 / 30.0;
 	private double _timeAccumulator = 0.0;
+
+	private int _scaledWidth;
+	private int _scaledHeight;
 
 	public bool IsPlaying { get; private set; } = false;
 	private bool _isLastFrameRetrieved = false;
@@ -258,18 +270,34 @@ public partial class VideoPlayer : Control
 
 		if (_mediaInfo.HasVideo == 1)
 		{
+			// Fetch current UI bounds
+			float targetW = _videoDisplay.Size.X;
+			float targetH = _videoDisplay.Size.Y;
+
+			// Prevent division by zero or invalid sizes
+			if (targetW <= 0 || targetH <= 0 || _mediaInfo.Width <= 0 || _mediaInfo.Height <= 0) return;
+
+			// Calculate scale factor to preserve aspect ratio (Aspect Fit)
+			float scale = Math.Min(targetW / _mediaInfo.Width, targetH / _mediaInfo.Height);
+
+			// Compute proportional integer dimensions (ensuring even numbers for YUV chroma alignment)
+			_scaledWidth = Math.Max(2, ((int)(_mediaInfo.Width * scale)) & ~1);
+			_scaledHeight = Math.Max(2, ((int)(_mediaInfo.Height * scale)) & ~1);
+
+			GD.Print($"Scaled Resolution: {_scaledWidth} x {_scaledHeight}");
+
 			lock (_videoLock)
 			{
 				// 500ms at 30 FPS = 15 Frames
 				_videoBuffer = new CircularBuffer<YuvFrame>(15);
-				InitializeYuvTextures(_mediaInfo.Width, _mediaInfo.Height);
+				InitializeYuvTextures(_scaledWidth, _scaledHeight);
 			}
 
 			// Render first frame to signal successful load
 			if (_mediaInfo.HasVideo == 0 || _containerHandle == IntPtr.Zero) return;
 
-			YuvFrame firstFrame = new YuvFrame(_videoWidth, _videoHeight);
-			int result = ReadNextVideoFrame(_containerHandle, firstFrame.Y, firstFrame.U, firstFrame.V);
+			YuvFrame firstFrame = new YuvFrame(_scaledWidth, _scaledHeight);
+			int result = ReadNextVideoFrame(_containerHandle, firstFrame.Y, firstFrame.U, firstFrame.V, _scaledWidth, _scaledHeight);
 
 			if (result == 0)
 			{
@@ -302,13 +330,23 @@ public partial class VideoPlayer : Control
 			IsBackground = true
 		};
 		_workerThread.Start();
+
+		// Start Dedicated Audio Feeder Thread
+		if (_mediaInfo.HasAudio == 1 && _audioPlayer != null)
+		{
+			_isAudioRunning = true;
+			_audioThread = new Thread(AudioFeederLoop)
+			{
+				Name = "Audio_Feeder_Thread",
+				IsBackground = true,
+				Priority = ThreadPriority.AboveNormal // Higher priority ensures audio never starves
+			};
+			_audioThread.Start();
+		}
 	}
 
 	private void InitializeYuvTextures(int width, int height)
 	{
-		_videoWidth = width;
-		_videoHeight = height;
-
 		int chromaW = width / 2;
 		int chromaH = height / 2;
 
@@ -379,8 +417,8 @@ public partial class VideoPlayer : Control
 			// --- DECODE VIDEO IF NEEDED ---
 			if (needMoreVideo)
 			{
-				YuvFrame frame = new YuvFrame(_videoWidth, _videoHeight);
-				int result = ReadNextVideoFrame(_containerHandle, frame.Y, frame.U, frame.V);
+				YuvFrame frame = new YuvFrame(_scaledWidth, _scaledHeight);
+				int result = ReadNextVideoFrame(_containerHandle, frame.Y, frame.U, frame.V, _scaledWidth, _scaledHeight);
 
 				if (result == 0)
 				{
@@ -414,17 +452,26 @@ public partial class VideoPlayer : Control
 		}
 	}
 
+	private void AudioFeederLoop()
+	{
+		while (_isAudioRunning)
+		{
+			if (IsPlaying && _mediaInfo.HasAudio == 1)
+			{
+				FillAudioBuffer();
+			}
+
+			// Sleep briefly (e.g. 5ms) to avoid spinning the CPU core 
+			// while giving plenty of headroom for 48kHz audio chunks
+			Thread.Sleep(5);
+		}
+	}
+
 	public override void _Process(double delta)
 	{
 		if (_containerHandle == IntPtr.Zero || !IsPlaying) return;
 
-		// 1. Audio Processing Priority
-		if (_mediaInfo.HasAudio == 1)
-		{
-			FillAudioBuffer();
-		}
-
-		// 2. Video Rendering Synchronization
+		// Video Rendering Synchronization
 		if (_mediaInfo.HasVideo == 1)
 		{
 			_timeAccumulator += delta;
@@ -469,9 +516,9 @@ public partial class VideoPlayer : Control
 
 	private void RenderFrame(YuvFrame frameToRender)
 	{
-		int chromaW = _videoWidth / 2;
-		int chromaH = _videoHeight / 2;
-		_yPlane.Update(_videoWidth, _videoHeight, frameToRender.Y);
+		int chromaW = _scaledWidth / 2;
+		int chromaH = _scaledHeight / 2;
+		_yPlane.Update(_scaledWidth, _scaledHeight, frameToRender.Y);
 		_uPlane.Update(chromaW, chromaH, frameToRender.U);
 		_vPlane.Update(chromaW, chromaH, frameToRender.V);
 	}
@@ -517,6 +564,14 @@ public partial class VideoPlayer : Control
 		{
 			_workerThread.Join(500);
 			_workerThread = null;
+		}
+
+		// Stop Audio Feeder Thread
+		_isAudioRunning = false;
+		if (_audioThread != null && _audioThread.IsAlive)
+		{
+			_audioThread.Join(500);
+			_audioThread = null;
 		}
 	}
 

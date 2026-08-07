@@ -10,7 +10,7 @@ shader = ExtResource("2_x0qam")
 mix_rate = 48000.0
 
 [node name="VideoPlayer" type="Control" unique_id=1526387276 node_paths=PackedStringArray("_videoDisplay", "_audioPlayer")]
-custom_minimum_size = Vector2(576, 324)
+custom_minimum_size = Vector2(640, 400)
 layout_mode = 3
 anchors_preset = 15
 anchor_right = 1.0
